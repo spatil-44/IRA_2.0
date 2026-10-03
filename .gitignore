@@ -6,5 +6,10 @@ __pycache__/
 .env
 secrets.h
 .venv-*/
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
 *.wav
 data/

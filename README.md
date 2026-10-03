@@ -3,20 +3,23 @@
 **A low-latency, low-power hybrid edge/cloud voice activation system**
 Smart India Hackathon 2026 · ISRO problem statement **SIH26172** · Team **NeuroVox**
 
-Ira uses an on-device, project-trained keyword spotter for the custom wake word
-“Ira”. Once activated, the ESP32-S3 streams short Opus packets to a local
-Raspberry Pi or Windows server for offline speech transcription with
-faster-whisper.
+The project is being built phone-first. The Android MVP captures voice only
+after the user taps to talk, then streams audio over the local network to a
+Raspberry Pi or Windows server for offline faster-whisper transcription. The
+ESP32-S3 edge wake-word path is the next hardware phase; its custom “Ira” model
+must be trained by the team rather than using a pretrained generic wake-word
+model.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Mic[INMP441] -->|16 kHz I2S| ESP[ESP32-S3]
+    Phone[Android app · tap to talk] -->|16 kHz PCM / WebSocket| Server[Local Pi or Windows server]
+    Mic[INMP441] -->|16 kHz I2S| ESP[ESP32-S3 · later phase]
     ESP --> MFCC[MFCC frontend]
     MFCC --> KWS[INT8 DS-CNN / TFLite Micro]
     KWS -->|Wake word detected| Opus[Opus audio stream]
-    Opus -->|WebSocket :8765 over local WiFi| Server[Local Pi or Windows server]
+    Opus -->|Opus / WebSocket :8765| Server
     Server --> Decode[Opus decode]
     Decode --> Whisper[faster-whisper, pre-cached model]
     Whisper -->|Transcript JSON| ESP
@@ -42,6 +45,21 @@ See [docs/architecture.md](./docs/architecture.md) for the full data flow.
 Detailed notes: [hardware/wiring.md](./hardware/wiring.md).
 
 ## Quick start
+
+### Android phone app (current phase)
+
+Install Android Studio with Android SDK Platform 35 and open the `phone`
+folder as a project. Let Gradle sync, connect an Android phone with USB
+debugging enabled, and run the `app` configuration. Start the local server as
+described below, then edit **Your local server** in Ira and enter its LAN
+hostname or address (for example `ws://YOUR_SERVER_HOST:8765`). The app asks
+for microphone access when you first tap **Start talking**.
+
+The phone records while the app is open, streams 16 kHz PCM, and automatically
+stops after 30 seconds. It uses no cloud speech service. Its development
+`ws://` connection is unencrypted; test only on a trusted private Wi-Fi network
+and do not expose the server to the public internet. The phone MVP is tap-to-talk;
+the project-trained on-device wake word is a follow-on phase.
 
 ### Firmware
 
@@ -104,7 +122,8 @@ python .\server\server.py
 The server binds to `0.0.0.0:8765`. Allow Python through Windows Firewall on
 your private WiFi network if prompted. Configure the ESP32 host in `secrets.h`
 with the laptop's LAN hostname/address; do not use the public internet address.
-The ESP32 and server must be on the same local network.
+The ESP32 and server must be on the same local network. This is the planned
+hardware phase; build the [phone app](./phone/README.md) first.
 
 ### Raspberry Pi and offline model caching
 
@@ -152,8 +171,10 @@ repeatable measurements from the target hardware.
 
 ## Repository map
 
-- `firmware/` — PlatformIO ESP32-S3 application, I2S capture, MFCC/TFLite
-  Micro inference, WebSocket and Opus streaming.
+- `phone/` — Android Kotlin/Compose tap-to-talk app, microphone capture, and
+  local PCM/WebSocket streaming.
+- `firmware/` — later-phase PlatformIO ESP32-S3 application, I2S capture,
+  MFCC/TFLite Micro inference, WebSocket and Opus streaming.
 - `ml/` — WAV dataset collection, shared MFCC frontend, DS-CNN training,
   integer quantization, and C-array exporter.
 - `server/` — asynchronous WebSocket endpoint and offline faster-whisper

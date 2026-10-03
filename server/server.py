@@ -64,8 +64,12 @@ async def send_error(websocket, message):
 
 async def handler(websocket, path=None):
     del path
+    await websocket.send(
+        json.dumps({"type": "ready", "sample_rate": SAMPLE_RATE})
+    )
     decoder = None
     resampler = None
+    stream_codec = None
     audio_parts = []
     audio_samples = 0
     stream_started = None
@@ -73,15 +77,23 @@ async def handler(websocket, path=None):
 
     async for message in websocket:
         if isinstance(message, bytes):
-            if decoder is None:
+            if stream_codec is None:
                 await send_error(websocket, "Send a start control message before audio.")
                 continue
-            try:
-                decoded = decode_packet(decoder, resampler, message)
-            except av.error.FFmpegError as error:
-                logger.warning("Rejected invalid Opus packet: %s", error)
-                await send_error(websocket, "Invalid Opus packet.")
-                continue
+            if stream_codec == "pcm_s16le":
+                if len(message) % 2:
+                    await send_error(websocket, "PCM audio must contain whole 16-bit samples.")
+                    continue
+                decoded = [
+                    np.frombuffer(message, dtype="<i2").astype(np.float32) / 32768.0
+                ]
+            else:
+                try:
+                    decoded = decode_packet(decoder, resampler, message)
+                except av.error.FFmpegError as error:
+                    logger.warning("Rejected invalid Opus packet: %s", error)
+                    await send_error(websocket, "Invalid Opus packet.")
+                    continue
             for part in decoded:
                 audio_samples += part.size
                 if audio_samples > MAX_AUDIO_SECONDS * SAMPLE_RATE:
@@ -103,24 +115,35 @@ async def handler(websocket, path=None):
         message_type = control.get("type")
         if message_type == "start":
             if control.get("sample_rate") != SAMPLE_RATE:
-                await send_error(websocket, "Only 16 kHz Opus streams are supported.")
+                await send_error(websocket, "Only 16 kHz audio streams are supported.")
                 continue
-            try:
-                decoder, resampler = new_decoder()
-            except av.error.FFmpegError as error:
-                logger.exception("Could not initialize the Opus decoder.")
-                await send_error(websocket, f"Opus decoder initialization failed: {error}")
+            codec = control.get("codec", "opus")
+            if codec not in {"opus", "pcm_s16le"}:
+                await send_error(websocket, "Unsupported audio codec.")
                 continue
+            if codec == "opus":
+                try:
+                    decoder, resampler = new_decoder()
+                except av.error.FFmpegError as error:
+                    logger.exception("Could not initialize the Opus decoder.")
+                    await send_error(
+                        websocket, f"Opus decoder initialization failed: {error}"
+                    )
+                    continue
+            else:
+                decoder, resampler = None, None
+            stream_codec = codec
             audio_parts = []
             audio_samples = 0
             packet_count = 0
             stream_started = time.perf_counter()
         elif message_type == "end":
-            if decoder is None or stream_started is None:
+            if stream_codec is None or stream_started is None:
                 await send_error(websocket, "No active audio stream.")
                 continue
             try:
-                audio_parts.extend(flush_decoder(decoder, resampler))
+                if stream_codec == "opus":
+                    audio_parts.extend(flush_decoder(decoder, resampler))
                 audio = (
                     np.concatenate(audio_parts)
                     if audio_parts
@@ -133,7 +156,7 @@ async def handler(websocket, path=None):
                 transcript = await asyncio.to_thread(transcribe_audio, audio)
                 latency_ms = (time.perf_counter() - stream_started) * 1000
                 logger.info(
-                    "Transcribed %d Opus packets (%d ms audio) in %.1f ms",
+                    "Transcribed %d audio frames (%d ms audio) in %.1f ms",
                     packet_count,
                     round(audio.size * 1000 / SAMPLE_RATE),
                     latency_ms,
@@ -153,6 +176,7 @@ async def handler(websocket, path=None):
             finally:
                 decoder = None
                 resampler = None
+                stream_codec = None
                 audio_parts = []
                 audio_samples = 0
                 stream_started = None
