@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .env
 secrets.h
+.venv-*/
+*.wav
+data/
