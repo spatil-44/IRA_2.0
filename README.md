@@ -1,28 +1,32 @@
 # Ira
 
-**A low-latency, low-power hybrid edge/cloud voice activation system**
+**A privacy-first local-network voice assistant and edge wake-word system**
 Smart India Hackathon 2026 · ISRO problem statement **SIH26172** · Team **NeuroVox**
 
-The project is being built phone-first. The Android MVP captures voice only
-after the user taps to talk, then streams audio over the local network to a
-Raspberry Pi or Windows server for offline faster-whisper transcription. The
-ESP32-S3 edge wake-word path is the next hardware phase; its custom “Ira” model
-must be trained by the team rather than using a pretrained generic wake-word
-model.
+Tap-to-talk on Android and voice requests from the ESP32 use the same local
+Raspberry Pi/Windows server for transcription and assistant replies. Android
+streams 16 kHz PCM and the ESP32 streams Opus over WebSocket on the private
+LAN. Android's optional wake-word/device-control mode remains phone-local.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Phone[Android app · tap to talk] -->|16 kHz PCM / WebSocket| Server[Local Pi or Windows server]
+    PhoneMic[Phone microphone] -->|On-device speech recognition| AndroidASR[Android on-device recognizer]
+    PhoneMic -->|PCM / WebSocket :8765 · LAN| Server[Local Pi or Windows server]
+    Server --> Whisper[faster-whisper]
+    Whisper --> Ollama[Local Ollama model]
+    Ollama -->|Transcript + reply| Phone[Android app]
+    AndroidASR[Phone-local recognizer] -->|Private wake word + command| Accessibility[User-enabled Accessibility]
+    Accessibility --> PhoneApps[Apps and Android settings]
     Mic[INMP441] -->|16 kHz I2S| ESP[ESP32-S3 · later phase]
     ESP --> MFCC[MFCC frontend]
     MFCC --> KWS[INT8 DS-CNN / TFLite Micro]
     KWS -->|Wake word detected| Opus[Opus audio stream]
-    Opus -->|Opus / WebSocket :8765| Server
+    Opus -->|Opus / WebSocket :8765 · LAN| Server
     Server --> Decode[Opus decode]
-    Decode --> Whisper[faster-whisper, pre-cached model]
-    Whisper -->|Transcript JSON| ESP
+    Decode --> Whisper
+    Ollama -->|Transcript + reply| ESP
 ```
 
 See [docs/architecture.md](./docs/architecture.md) for the full data flow.
@@ -49,17 +53,20 @@ Detailed notes: [hardware/wiring.md](./hardware/wiring.md).
 ### Android phone app (current phase)
 
 Install Android Studio with Android SDK Platform 35 and open the `phone`
-folder as a project. Let Gradle sync, connect an Android phone with USB
-debugging enabled, and run the `app` configuration. Start the local server as
-described below, then edit **Your local server** in Ira and enter its LAN
-hostname or address (for example `ws://YOUR_SERVER_HOST:8765`). The app asks
-for microphone access when you first tap **Start talking**.
+folder as a project. Let Gradle sync, connect an Android 12+ phone with USB
+debugging enabled, and run the `app` configuration. Connect the phone to the
+same trusted Wi-Fi network as the Pi, enter its address in Ira's **Raspberry
+Pi Server** card (for example, `ws://192.168.1.50:8765/`), and tap **Save Pi
+address**. **Start talking** streams audio to the Pi for transcription and
+assistant replies; the server accepts up to 30 seconds per utterance.
 
-The phone records while the app is open, streams 16 kHz PCM, and automatically
-stops after 30 seconds. It uses no cloud speech service. Its development
-`ws://` connection is unencrypted; test only on a trusted private Wi-Fi network
-and do not expose the server to the public internet. The phone MVP is tap-to-talk;
-the project-trained on-device wake word is a follow-on phase.
+For hands-free device control, enable Ira's Accessibility service in Android
+settings and start private wake-word listening. Say “Ira” followed by a
+command to open apps or settings, tap visible controls, type into the focused
+field, or navigate. This optional control mode continues to use the phone's
+on-device recognizer. A foreground notification and Android's microphone
+indicator remain visible while it listens. See [phone/README.md](./phone/README.md)
+for setup details and the WebSocket transport's LAN security limits.
 
 ### Firmware
 
@@ -116,16 +123,21 @@ environment:
 py -3 -m venv .venv-server
 .\.venv-server\Scripts\Activate.ps1
 python -m pip install -r .\server\requirements.txt
+ollama pull tinyllama:latest
 python .\server\server.py
 ```
 
 The server binds to `0.0.0.0:8765`. Allow Python through Windows Firewall on
 your private WiFi network if prompted. Configure the ESP32 host in `secrets.h`
-with the laptop's LAN hostname/address; do not use the public internet address.
-The ESP32 and server must be on the same local network. This is the planned
-hardware phase; build the [phone app](./phone/README.md) first.
+and enter the same server LAN address in the Android app. Keep both clients and
+the server on the same trusted LAN; do not use or expose a public internet
+address. `ws://` traffic is unencrypted, so do not forward port 8765 from the
+router. The Ira server starts local Ollama automatically when it is not already
+running. Install Ollama and pull a model once; set `IRA_OLLAMA_MODEL` before
+starting the server to select another installed model. See
+[server/README.md](./server/README.md).
 
-### Raspberry Pi and offline model caching
+### Raspberry Pi and offline server model caching
 
 On the Pi, create a virtual environment and install `server/requirements.txt`.
 Before disconnecting from the internet, download the selected model once:
@@ -171,8 +183,8 @@ repeatable measurements from the target hardware.
 
 ## Repository map
 
-- `phone/` — Android Kotlin/Compose tap-to-talk app, microphone capture, and
-  local PCM/WebSocket streaming.
+- `phone/` — Android Kotlin/Compose app with Pi-backed tap-to-talk, optional
+  phone-local device control, and private WAV collection.
 - `firmware/` — later-phase PlatformIO ESP32-S3 application, I2S capture,
   MFCC/TFLite Micro inference, WebSocket and Opus streaming.
 - `ml/` — WAV dataset collection, shared MFCC frontend, DS-CNN training,

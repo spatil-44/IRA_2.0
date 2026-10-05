@@ -1,4 +1,5 @@
 <resources>
+    <string name="ira_accessibility_service_description">Lets Ira act on visible app controls only when you issue an on-device voice command. Screen content is not stored or sent to a server.</string>
     <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:colorAccent">#9CF5D5</item>

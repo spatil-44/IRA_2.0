@@ -4,12 +4,16 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
+import urllib.error
+import urllib.request
 
 import av
 import numpy as np
 import websockets
 from faster_whisper import WhisperModel
+from ollama_runtime import ensure_ollama_running
 
 HOST = "0.0.0.0"
 PORT = 8765
@@ -18,6 +22,9 @@ MAX_AUDIO_SECONDS = 30
 MODEL_NAME = os.environ.get("IRA_WHISPER_MODEL", "small")
 DEVICE = os.environ.get("IRA_WHISPER_DEVICE", "cpu")
 COMPUTE_TYPE = os.environ.get("IRA_WHISPER_COMPUTE_TYPE", "int8")
+OLLAMA_URL = os.environ.get("IRA_OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+OLLAMA_MODEL = os.environ.get("IRA_OLLAMA_MODEL", "tinyllama:latest")
+OLLAMA_TIMEOUT_SECONDS = 240
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ira.server")
 model = None
+model_lock = threading.Lock()
 
 
 def new_decoder():
@@ -54,8 +62,46 @@ def flush_decoder(decoder, resampler):
 
 
 def transcribe_audio(audio):
-    segments, _ = model.transcribe(audio, vad_filter=True)
-    return " ".join(segment.text.strip() for segment in segments).strip()
+    with model_lock:
+        segments, _ = model.transcribe(audio, vad_filter=True)
+        return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def generate_assistant_reply(transcript):
+    request_body = json.dumps(
+        {
+            "model": OLLAMA_MODEL,
+            "system": (
+                "You are Ira, a helpful, friendly voice assistant. "
+                "Answer the user's request clearly and concisely. "
+                "If the request is ambiguous, ask one brief clarification question."
+            ),
+            "prompt": transcript,
+            "stream": False,
+            "options": {"temperature": 0.4, "num_predict": 160},
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        OLLAMA_URL,
+        data=request_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Ollama returned HTTP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Could not reach Ollama at {OLLAMA_URL}: {error.reason}") from error
+    except TimeoutError as error:
+        raise RuntimeError("Ollama did not finish generating a reply in time.") from error
+
+    reply = result.get("response", "").strip()
+    if not reply:
+        raise RuntimeError("Ollama returned an empty assistant reply.")
+    return reply
 
 
 async def send_error(websocket, message):
@@ -154,21 +200,40 @@ async def handler(websocket, path=None):
                     decoder = None
                     continue
                 transcript = await asyncio.to_thread(transcribe_audio, audio)
+                assistant_started = time.perf_counter()
+                try:
+                    assistant_reply = await asyncio.to_thread(
+                        generate_assistant_reply, transcript
+                    )
+                    assistant_error = None
+                except (RuntimeError, OSError, ValueError) as error:
+                    logger.exception("Assistant reply generation failed.")
+                    assistant_reply = None
+                    assistant_error = str(error)
+                assistant_latency_ms = (
+                    time.perf_counter() - assistant_started
+                ) * 1000
                 latency_ms = (time.perf_counter() - stream_started) * 1000
                 logger.info(
-                    "Transcribed %d audio frames (%d ms audio) in %.1f ms",
+                    "Transcribed %d audio frames (%d ms audio) in %.1f ms; "
+                    "assistant generation took %.1f ms",
                     packet_count,
                     round(audio.size * 1000 / SAMPLE_RATE),
                     latency_ms,
+                    assistant_latency_ms,
                 )
+                result = {
+                    "type": "transcript",
+                    "text": transcript,
+                    "latency_ms": round(latency_ms, 1),
+                    "assistant_latency_ms": round(assistant_latency_ms, 1),
+                }
+                if assistant_reply is not None:
+                    result["assistant_reply"] = assistant_reply
+                if assistant_error is not None:
+                    result["assistant_error"] = assistant_error
                 await websocket.send(
-                    json.dumps(
-                        {
-                            "type": "transcript",
-                            "text": transcript,
-                            "latency_ms": round(latency_ms, 1),
-                        }
-                    )
+                    json.dumps(result)
                 )
             except (av.error.FFmpegError, RuntimeError, ValueError, OSError) as error:
                 logger.exception("Transcription failed.")
@@ -186,6 +251,12 @@ async def handler(websocket, path=None):
 
 async def main():
     global model
+    try:
+        ensure_ollama_running(OLLAMA_URL)
+    except RuntimeError as error:
+        logger.error("Could not start Ollama: %s", error)
+        raise SystemExit(1) from error
+
     logger.info(
         "Loading Whisper model %s (device=%s, compute_type=%s)",
         MODEL_NAME,

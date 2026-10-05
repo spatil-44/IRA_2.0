@@ -1,4 +1,4 @@
-av>=12,<15
+av>=12,<14.3
 faster-whisper>=1.1,<2
 numpy>=1.26,<3
 websockets>=12,<16
